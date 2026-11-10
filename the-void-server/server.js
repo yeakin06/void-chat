@@ -60,6 +60,54 @@ let vanished = 0;
 const history = [];           // global history (last 50)
 const NEXUS = 'The Nexus';
 
+// ---- Void Bot: labeled bot so nobody is left alone ----
+const BOT_ID = 'void-bot';
+const BOT_WAIT_MS = 6000; // wait this long for a real person before the bot steps in
+const pick = a => a[crypto.randomInt(0, a.length)];
+function botReply(t) {
+  const x = String(t || '').toLowerCase();
+  if (/^(hi|hey|hello|yo|sup|hola|hii+)\b/.test(x)) return pick(['Hey! Good to see you here 👋', 'Hello! What brings you to the Void?', 'Hi there! How is your day going?']);
+  if (/how are you|how r u|wyd|what.?s up/.test(x)) return pick(["I'm a bot, so always floating in the Void. How about you?", 'Doing great, thanks for asking! You?']);
+  if (/(are you|r u).*(bot|real|human|ai)|bot\?/.test(x)) return "Yes, I'm Void Bot, a program. A real person will show up when someone else joins!";
+  if (/\b(bye|goodbye|cya|gtg)\b/.test(x)) return 'See you later! Come back anytime 👋';
+  if (/\b(name|who are you)\b/.test(x)) return "I'm Void Bot 🤖. I keep the Void company when it's quiet.";
+  if (/music|song/.test(x)) return 'Music is great. Try the music button to share a song!';
+  if (/game|play/.test(x)) return 'Games are fun. Try the game button to start one!';
+  if (x.includes('?')) return pick(['Good question. What do you think?', "Hmm, I'm only a simple bot. What's your take?", 'Tell me more, I like that question.']);
+  return pick(['Interesting, tell me more.', 'Ha, I like that.', 'Go on, I am listening.', 'That makes sense. What else is on your mind?', 'Nice! What else?', "I'm only a bot, but I'm happy to chat."]);
+}
+function botSay(s, t, delay) {
+  setTimeout(() => {
+    const u = users.get(s.id), r = u && rooms.get(u.room); if (!r || !r.bot) return;
+    s.emit('typing');
+    setTimeout(() => {
+      const u2 = users.get(s.id), r2 = u2 && rooms.get(u2.room); if (!r2 || !r2.bot) return;
+      s.emit('receive_message', { id: 'bot' + Date.now(), text: t, type: 'text' });
+    }, 900);
+  }, delay || 1200);
+}
+function scheduleBot(s) {
+  const u = users.get(s.id); if (!u) return;
+  clearTimeout(u.botTimer);
+  u.botTimer = setTimeout(() => {
+    const u2 = users.get(s.id);
+    if (!u2 || u2.room || !waiting.includes(s.id)) return;
+    waiting = waiting.filter(i => i !== s.id);
+    const roomId = crypto.randomUUID();
+    rooms.set(roomId, { members: [s.id, BOT_ID], max: 1500, used: 0, isPrivate: false, bot: true });
+    u2.room = roomId;
+    s.emit('match_found', { roomId, karma: '5.0', flag: '🤖' });
+    botSay(s, "Hi! I'm Void Bot 🤖. Nobody else is online right now, so I'll keep you company. Click Next anytime to look for a real person.", 800);
+  }, BOT_WAIT_MS);
+}
+const nexusSize = () => (io.sockets.adapter.rooms.get(NEXUS) || { size: 0 }).size;
+function globalBot(s, t) {
+  setTimeout(() => {
+    const u = users.get(s.id); if (!u || !u.global || nexusSize() > 1) return;
+    s.emit('receive_global', { id: 'bot' + Date.now(), sender: 'Void Bot 🤖', text: t, type: 'text' });
+  }, 1800);
+}
+
 const me = s => users.get(s.id);
 const peerOf = s => { const u = me(s); const r = u && rooms.get(u.room); return r ? r.members.find(i => i !== s.id) : null; };
 const text = v => (typeof v === 'string' ? v.slice(0, 5000) : '');
@@ -80,7 +128,7 @@ function endRoom(roomId, exceptId) {
 }
 function leave(s) {
   waiting = waiting.filter(i => i !== s.id);
-  const u = me(s); if (u && u.room) endRoom(u.room, s.id);
+  const u = me(s); if (u) clearTimeout(u.botTimer); if (u && u.room) endRoom(u.room, s.id);
   if (u && u.global) { s.leave(NEXUS); u.global = false; }
 }
 function makeRoom(a, b, isPrivate) {
@@ -105,7 +153,7 @@ io.on('connection', socket => {
   socket.on('find_match', () => {
     const u = me(socket); leave(socket);
     const otherId = waiting.find(i => i !== socket.id && users.has(i));
-    if (!otherId) return void waiting.push(socket.id);
+    if (!otherId) { waiting.push(socket.id); scheduleBot(socket); return; }
     waiting = waiting.filter(i => i !== otherId);
     const other = io.sockets.sockets.get(otherId), ou = users.get(otherId);
     const roomId = makeRoom(socket, other, false);
@@ -119,6 +167,7 @@ io.on('connection', socket => {
     if (!u.alias) u.alias = 'Void-' + crypto.randomInt(1000, 9999);
     socket.emit('global_joined', { alias: u.alias });
     socket.emit('global_history', history);
+    if (nexusSize() <= 1) globalBot(socket, "Hey! I'm Void Bot 🤖. You're the only one in The Nexus right now. Say something and I'll reply until real people arrive.");
   });
 
   socket.on('send_global', m => {
@@ -131,6 +180,7 @@ io.on('connection', socket => {
       cover: text(m.cover).slice(0, 500), title: text(m.title).slice(0, 200), artist: text(m.artist).slice(0, 200), replyTo: m.replyTo };
     history.push(msg); if (history.length > 50) history.shift();
     socket.to(NEXUS).emit('receive_global', msg); spy(NEXUS, msg);
+    if (nexusSize() <= 1) globalBot(socket, botReply(msg.text));
   });
 
   socket.on('send_message', m => {
@@ -145,6 +195,7 @@ io.on('connection', socket => {
     spy(u.room, msg);
     io.to(r.members).emit('sync_chars', { max: r.max, used: r.used });
     if (r.used >= r.max) io.to(r.members).emit('force_shatter');
+    if (r.bot) botSay(socket, botReply(t));
   });
 
   socket.on('typing', () => { const p = peerOf(socket); if (p) io.to(p).emit('typing'); });
