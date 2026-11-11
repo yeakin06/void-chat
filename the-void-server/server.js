@@ -50,10 +50,10 @@ app.post('/upload', (req, res) => {
     if (err || !req.file || !EXT[req.file.mimetype]) return res.status(400).json({ success: false });
     const name = crypto.randomBytes(12).toString('hex') + EXT[req.file.mimetype];
     fs.writeFileSync(path.join(UPLOAD_DIR, name), req.file.buffer);
-    res.json({ success: true, data: { url: `${PUBLIC_URL}/uploads/${name}` } });
+    res.json({ success: true, data: { url: `${req.protocol}://${req.get('host')}/uploads/${name}` } }); // built from the request so it is always the real public address
   });
 });
-app.use('/uploads', express.static(UPLOAD_DIR, { setHeaders: r => r.setHeader('X-Content-Type-Options', 'nosniff') }));
+app.use('/uploads', express.static(UPLOAD_DIR, { setHeaders: r => { r.setHeader('X-Content-Type-Options', 'nosniff'); r.setHeader('Cross-Origin-Resource-Policy', 'cross-origin'); } }));
 
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: ORIGINS.length ? ORIGINS : false }, maxHttpBufferSize: 4e5 });
@@ -261,10 +261,20 @@ function globalBot(s, t) {
 const me = s => users.get(s.id);
 const peerOf = s => { const u = me(s); const r = u && rooms.get(u.room); return r ? r.members.find(i => i !== s.id) : null; };
 const text = (v, n = 5000) => (typeof v === 'string' ? v.slice(0, n) : '');
-const spy = (roomId, m) => io.to('admins').emit('spy_feed', { roomId, text: esc(m.text || ''), type: m.type, url: m.type === 'image' || m.type === 'music' ? esc(m.url || '') : undefined, cover: esc(m.cover || ''), title: esc(m.title || ''), artist: esc(m.artist || '') });
+const spy = (roomId, m, sid) => io.to('admins').emit('spy_feed', { roomId, uid: sid ? uidOf(sid) : undefined, text: esc(m.text || ''), type: m.type, url: m.type === 'image' || m.type === 'music' ? esc(m.url || '') : undefined, cover: esc(m.cover || ''), title: esc(m.title || ''), artist: esc(m.artist || '') });
 const failsByIp = new Map();
-const ipOf = s => String((s.handshake.headers['x-forwarded-for'] || s.handshake.address || '')).split(',')[0].trim();
+const ipOf = s => String((s.handshake.headers['x-forwarded-for'] || s.handshake.address || '')).split(',').pop().trim();
 const authFail = (u, s) => { const ip = ipOf(s), n = Date.now(); const f = (failsByIp.get(ip) || []).filter(t => n - t < 300000); f.push(n); failsByIp.set(ip, f); return f.length > 8; };
+// ---- admin tools ----
+const T0 = Date.now(); let peak = 0, msgCount = 0, nexusLocked = false, banSeq = 0;
+const bans = new Map(); // id -> { ip, label, ts } (memory only: cleared when the server restarts)
+const uidOf = id => crypto.createHash('sha1').update(String(id)).digest('hex').slice(0, 6);
+const maskIp = ip => /^\d+\.\d+\.\d+\.\d+$/.test(ip) ? ip.split('.').slice(0, 2).join('.') + '.*.*' : String(ip).slice(0, 6) + '…';
+const banList = () => [...bans].map(([id, b]) => ({ id, label: b.label, ts: b.ts }));
+const isBanned = ip => [...bans.values()].some(b => b.ip === ip);
+const adminStats = () => ({ online: io.engine.clientsCount, waiting: waiting.length, rooms: rooms.size, bots: [...rooms.values()].filter(r => r.bot).length,
+  nexus: nexusSize(), vanished, peak, msgs: msgCount, up: Math.floor((Date.now() - T0) / 1000), mem: Math.round(process.memoryUsage().rss / 1048576), locked: nexusLocked, bans: bans.size });
+setInterval(() => { peak = Math.max(peak, io.engine.clientsCount); io.to('admins').emit('admin_stats', adminStats()); }, 3000);
 const stats = () => ({ activeUsers: io.engine.clientsCount, vanishedChats: vanished });
 setInterval(() => io.emit('stats_update', stats()), 4000);
 
@@ -289,6 +299,8 @@ function makeRoom(a, b, isPrivate) {
 }
 
 io.on('connection', socket => {
+  if (isBanned(ipOf(socket))) { socket.emit('banned'); return socket.disconnect(true); }
+  peak = Math.max(peak, io.engine.clientsCount);
   users.set(socket.id, { alias: null, admin: false, god: false, room: null, global: false, lastGlobal: 0 });
   socket.emit('stats_update', stats());
 
@@ -296,9 +308,29 @@ io.on('connection', socket => {
     const u = me(socket); if (authFail(u, socket)) return socket.emit('admin_error');
     if (typeof pass === 'string' && safeEq(pass, ADMIN_PASSWORD)) {
       u.admin = true; socket.join('admins');
-      socket.emit('admin_dashboard', { totalUsers: io.engine.clientsCount, waitingUsers: waiting.length, activeRooms: rooms.size, totalVanished: vanished });
+      socket.emit('admin_bans', banList()); socket.emit('admin_stats', adminStats()); socket.emit('admin_dashboard', { totalUsers: io.engine.clientsCount, waitingUsers: waiting.length, activeRooms: rooms.size, totalVanished: vanished });
     } else socket.emit('admin_error');
   });
+
+  const adm = () => { const u = me(socket); return u && u.admin ? u : null; };
+  socket.on('admin_broadcast', t => { if (!adm()) return; t = text(t, 200).trim(); if (t) io.emit('announcement', { text: t }); });
+  socket.on('admin_end_room', id => { if (adm() && typeof id === 'string' && rooms.has(id)) endRoom(id); });
+  socket.on('admin_nexus', a => {
+    if (!adm()) return;
+    if (a === 'lock') { nexusLocked = !nexusLocked; io.emit('announcement', { text: nexusLocked ? 'The Nexus is locked by an admin.' : 'The Nexus is open again.' }); }
+    else if (a === 'clear') history.length = 0;
+    io.to('admins').emit('admin_stats', adminStats());
+  });
+  socket.on('admin_ban', uid => {
+    if (!adm() || typeof uid !== 'string') return;
+    for (const [id, u] of users) if (!u.admin && uidOf(id) === uid) {
+      const t = io.sockets.sockets.get(id); if (!t) continue;
+      const ip = ipOf(t); bans.set('b' + (++banSeq), { ip, label: maskIp(ip), ts: Date.now() });
+      t.emit('banned'); t.disconnect(true);
+      io.to('admins').emit('admin_bans', banList()); io.to('admins').emit('admin_stats', adminStats()); break;
+    }
+  });
+  socket.on('admin_unban', id => { if (adm() && bans.delete(id)) { io.to('admins').emit('admin_bans', banList()); io.to('admins').emit('admin_stats', adminStats()); } });
 
   socket.on('god_auth', pass => {
     const u = me(socket); if (!GOD_ON) return socket.emit('god_error');
@@ -329,6 +361,7 @@ io.on('connection', socket => {
 
   socket.on('send_global', m => {
     const u = me(socket); if (!u.global || !m) return;
+    if (nexusLocked && !u.admin && !u.god) return socket.emit('announcement', { text: 'The Nexus is locked right now.' });
     const now = Date.now();
     if (!u.god && now - u.lastGlobal < 10000) return;
     u.lastGlobal = now;
@@ -336,7 +369,7 @@ io.on('connection', socket => {
       text: text(m.text, u.god ? GOD_MAX : 5000), type: ['image', 'music'].includes(m.type) ? m.type : 'text', url: text(m.url).slice(0, 500),
       cover: text(m.cover).slice(0, 500), title: text(m.title).slice(0, 200), artist: text(m.artist).slice(0, 200), replyTo: m.replyTo };
     history.push(msg); if (history.length > 50) history.shift();
-    socket.to(NEXUS).emit('receive_global', msg); spy(NEXUS, msg);
+    socket.to(NEXUS).emit('receive_global', msg); spy(NEXUS, msg, socket.id); msgCount++;
     if (nexusSize() <= 1) globalBot(socket, botReply(msg.text));
   });
 
@@ -349,7 +382,8 @@ io.on('connection', socket => {
       cover: text(m.cover).slice(0, 500), title: text(m.title).slice(0, 200), artist: text(m.artist).slice(0, 200),
       replyTo: m.replyTo };
     const p = peerOf(socket); if (p) io.to(p).emit('receive_message', msg);
-    spy(u.room, msg);
+    if (msg.type !== 'text') socket.emit('receive_message', msg); // echo photos/music back so the sender sees them too
+    spy(u.room, msg, socket.id); msgCount++;
     io.to(r.members).emit('sync_chars', { max: r.max, used: r.used });
     if (!u.god && r.used >= r.max) io.to(r.members).emit('force_shatter');
     if (r.bot) botSay(socket, botReply(t));
