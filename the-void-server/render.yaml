@@ -2,6 +2,7 @@ services:
   - type: web
     name: my-void-server
     runtime: node
+    plan: free
     buildCommand: npm install
     startCommand: npm start
     envVars:
@@ -10,4 +11,6 @@ services:
       - key: CORS_ORIGIN
         sync: false
       - key: PUBLIC_URL
+        sync: false
+      - key: GOD_PASSWORD
         sync: false
