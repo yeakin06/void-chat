@@ -270,11 +270,26 @@ const T0 = Date.now(); let peak = 0, msgCount = 0, nexusLocked = false, banSeq =
 const bans = new Map(); // id -> { ip, label, ts } (memory only: cleared when the server restarts)
 const uidOf = id => crypto.createHash('sha1').update(String(id)).digest('hex').slice(0, 6);
 const maskIp = ip => /^\d+\.\d+\.\d+\.\d+$/.test(ip) ? ip.split('.').slice(0, 2).join('.') + '.*.*' : String(ip).slice(0, 6) + '…';
-const banList = () => [...bans].map(([id, b]) => ({ id, label: b.label, ts: b.ts }));
-const isBanned = ip => [...bans.values()].some(b => b.ip === ip);
+const banList = () => [...bans].map(([id, b]) => ({ id, label: b.label, ts: b.ts, until: b.until || 0 }));
+const isBanned = ip => [...bans.values()].some(b => b.ip === ip && (!b.until || b.until > Date.now()));
 const adminStats = () => ({ online: io.engine.clientsCount, waiting: waiting.length, rooms: rooms.size, bots: [...rooms.values()].filter(r => r.bot).length,
-  nexus: nexusSize(), vanished, peak, msgs: msgCount, up: Math.floor((Date.now() - T0) / 1000), mem: Math.round(process.memoryUsage().rss / 1048576), locked: nexusLocked, bans: bans.size });
-setInterval(() => { peak = Math.max(peak, io.engine.clientsCount); io.to('admins').emit('admin_stats', adminStats()); }, 3000);
+  nexus: nexusSize(), vanished, peak, msgs: msgCount, up: Math.floor((Date.now() - T0) / 1000), mem: Math.round(process.memoryUsage().rss / 1048576), locked: nexusLocked, bans: bans.size, words: [...blocked].join(', '), linkBlock });
+setInterval(() => { for (const [id, b] of bans) if (b.until && b.until < Date.now()) bans.delete(id); peak = Math.max(peak, io.engine.clientsCount); io.to('admins').emit('admin_stats', adminStats()); }, 3000);
+// ---- safety: reports, blocks, filters, auto-mute ----
+let repSeq = 0, linkBlock = true, wordRe = null;
+const reports = [], reportIps = new Map(), repBy = new Map(), mutedIps = new Map(), blocksByIp = new Map(), nexusOwners = new Map();
+const blocked = new Set((process.env.BLOCKED_WORDS || '').split(',').map(w => w.trim().toLowerCase()).filter(Boolean));
+const buildWordRe = () => { wordRe = blocked.size ? new RegExp('\\b(' + [...blocked].map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')\\b', 'gi') : null; };
+buildWordRe();
+const clean = (t, u) => {
+  if (!t || (u && (u.admin || u.god))) return t;
+  if (linkBlock) t = t.replace(/(https?:\/\/|www\.)\S+/gi, '[link removed]');
+  if (wordRe) t = t.replace(wordRe, '•••');
+  return t;
+};
+const isMuted = s => (mutedIps.get(ipOf(s)) || 0) > Date.now();
+const blockedPair = (s, otherId) => { const o = io.sockets.sockets.get(otherId); if (!o) return false; const a = ipOf(s), b = ipOf(o); return (blocksByIp.get(a) || new Set()).has(b) || (blocksByIp.get(b) || new Set()).has(a); };
+const banIp = (ip, hours) => { bans.set('b' + (++banSeq), { ip, label: maskIp(ip), ts: Date.now(), until: hours ? Date.now() + hours * 3600e3 : 0 }); io.to('admins').emit('admin_bans', banList()); io.to('admins').emit('admin_stats', adminStats()); };
 const stats = () => ({ activeUsers: io.engine.clientsCount, vanishedChats: vanished });
 setInterval(() => io.emit('stats_update', stats()), 4000);
 
@@ -308,7 +323,7 @@ io.on('connection', socket => {
     const u = me(socket); if (authFail(u, socket)) return socket.emit('admin_error');
     if (typeof pass === 'string' && safeEq(pass, ADMIN_PASSWORD)) {
       u.admin = true; socket.join('admins');
-      socket.emit('admin_bans', banList()); socket.emit('admin_stats', adminStats()); socket.emit('admin_dashboard', { totalUsers: io.engine.clientsCount, waitingUsers: waiting.length, activeRooms: rooms.size, totalVanished: vanished });
+      socket.emit('admin_bans', banList()); socket.emit('admin_reports', reports); socket.emit('admin_stats', adminStats()); socket.emit('admin_dashboard', { totalUsers: io.engine.clientsCount, waitingUsers: waiting.length, activeRooms: rooms.size, totalVanished: vanished });
     } else socket.emit('admin_error');
   });
 
@@ -321,14 +336,47 @@ io.on('connection', socket => {
     else if (a === 'clear') history.length = 0;
     io.to('admins').emit('admin_stats', adminStats());
   });
-  socket.on('admin_ban', uid => {
-    if (!adm() || typeof uid !== 'string') return;
-    for (const [id, u] of users) if (!u.admin && uidOf(id) === uid) {
-      const t = io.sockets.sockets.get(id); if (!t) continue;
-      const ip = ipOf(t); bans.set('b' + (++banSeq), { ip, label: maskIp(ip), ts: Date.now() });
-      t.emit('banned'); t.disconnect(true);
-      io.to('admins').emit('admin_bans', banList()); io.to('admins').emit('admin_stats', adminStats()); break;
-    }
+  socket.on('admin_ban', d => {
+    if (!adm() || !d || typeof d.uid !== 'string') return;
+    const hours = Math.max(0, Math.min(Number(d.hours) || 0, 8760));
+    for (const [id, u] of users) if (!u.admin && uidOf(id) === d.uid) { const t = io.sockets.sockets.get(id); if (!t) continue; banIp(ipOf(t), hours); t.emit('banned'); t.disconnect(true); break; }
+  });
+  socket.on('admin_ban_report', d => {
+    if (!adm() || !d) return; const ip = reportIps.get(d.id);
+    if (!ip) return socket.emit('announcement', { text: 'That report is gone, so the user could not be banned.' });
+    banIp(ip, Math.max(0, Math.min(Number(d.hours) || 0, 8760)));
+  });
+  socket.on('admin_dismiss', id => { if (!adm()) return; const i = reports.findIndex(r => r.id === id); if (i >= 0) { reports.splice(i, 1); reportIps.delete(id); io.to('admins').emit('admin_reports', reports); } });
+  socket.on('admin_delete_file', url => {
+    if (!adm()) return; const name = String(url || '').split('?')[0].split('/').pop();
+    if (/^[a-f0-9]{24}\.(jpg|png|gif|webp)$/.test(name)) fs.unlink(path.join(UPLOAD_DIR, name), () => socket.emit('announcement', { text: 'Photo deleted.' }));
+  });
+  socket.on('admin_words', str => { if (!adm()) return; blocked.clear(); String(str || '').slice(0, 2000).split(',').map(w => w.trim().toLowerCase()).filter(Boolean).slice(0, 200).forEach(w => blocked.add(w)); buildWordRe(); io.to('admins').emit('admin_stats', adminStats()); });
+  socket.on('admin_linkblock', () => { if (!adm()) return; linkBlock = !linkBlock; io.to('admins').emit('admin_stats', adminStats()); });
+
+  // users: report + block
+  socket.on('report', d => {
+    const u = me(socket); if (!u || !d) return; const now = Date.now();
+    if (now - (u.lastReport || 0) < 20000) return; u.lastReport = now;
+    const reason = ['Harassment', 'Sexual content', 'Spam or scam', 'Inappropriate photo', 'Other'].includes(d.reason) ? d.reason : 'Other';
+    let targetId = null, lines = [], kind = 'chat'; const r = rooms.get(u.room);
+    if (r && !r.bot) { targetId = peerOf(socket); lines = (r.log || []).slice(-15); }
+    else if (u.global && typeof d.msgId === 'string') { kind = 'nexus'; targetId = nexusOwners.get(d.msgId) || null; lines = history.slice(-15).map(m => ({ uid: nexusOwners.get(m.id), t: m.type, text: m.text, url: m.url, who: m.sender })); }
+    const t = targetId && io.sockets.sockets.get(targetId); if (!t || t.id === socket.id) return;
+    const tUid = uidOf(t.id), tIp = ipOf(t);
+    const rep = { id: 'r' + (++repSeq), ts: now, reason, kind, target: tUid, lines: lines.map(l => ({ mine: l.uid === t.id, t: l.t, who: l.who, text: esc(l.text || '').slice(0, 300), url: l.t === 'image' ? esc(l.url || '') : undefined })) };
+    reports.push(rep); reportIps.set(rep.id, tIp); if (reports.length > 100) { const o = reports.shift(); reportIps.delete(o.id); }
+    const set = repBy.get(tIp) || new Set(); set.add(ipOf(socket)); repBy.set(tIp, set);
+    if (set.size >= 3 && !isMuted(t)) { mutedIps.set(tIp, now + 30 * 60000); rep.autoMuted = true; t.emit('announcement', { text: 'You are muted for 30 minutes after several reports.' }); }
+    io.to('admins').emit('admin_report', rep);
+    socket.emit('announcement', { text: 'Thanks, your report was sent to the admins.' });
+  });
+  socket.on('block', () => {
+    const u = me(socket), r = u && rooms.get(u.room); if (!r || r.bot) return;
+    const pid = peerOf(socket), t = pid && io.sockets.sockets.get(pid); if (!t) return;
+    const a = ipOf(socket), b = ipOf(t); if (a === b) return; // same network: blocking would block yourself
+    const set = blocksByIp.get(a) || new Set(); set.add(b); blocksByIp.set(a, set);
+    leave(socket); socket.emit('announcement', { text: 'User blocked. You will not be matched with them again.' });
   });
   socket.on('admin_unban', id => { if (adm() && bans.delete(id)) { io.to('admins').emit('admin_bans', banList()); io.to('admins').emit('admin_stats', adminStats()); } });
 
@@ -341,7 +389,7 @@ io.on('connection', socket => {
 
   socket.on('find_match', () => {
     const u = me(socket); leave(socket);
-    const otherId = waiting.find(i => i !== socket.id && users.has(i));
+    const otherId = waiting.find(i => i !== socket.id && users.has(i) && !blockedPair(socket, i));
     if (!otherId) { waiting.push(socket.id); scheduleBot(socket); return; }
     waiting = waiting.filter(i => i !== otherId);
     const other = io.sockets.sockets.get(otherId), ou = users.get(otherId);
@@ -362,12 +410,14 @@ io.on('connection', socket => {
   socket.on('send_global', m => {
     const u = me(socket); if (!u.global || !m) return;
     if (nexusLocked && !u.admin && !u.god) return socket.emit('announcement', { text: 'The Nexus is locked right now.' });
+    if (isMuted(socket)) return socket.emit('announcement', { text: 'You are muted for a while after reports.' });
     const now = Date.now();
     if (!u.god && now - u.lastGlobal < 10000) return;
     u.lastGlobal = now;
     const msg = { id: text(m.id).slice(0, 60), sender: u.alias,
-      text: text(m.text, u.god ? GOD_MAX : 5000), type: ['image', 'music'].includes(m.type) ? m.type : 'text', url: text(m.url).slice(0, 500),
+      text: clean(text(m.text, u.god ? GOD_MAX : 5000), u), type: ['image', 'music'].includes(m.type) ? m.type : 'text', url: text(m.url).slice(0, 500),
       cover: text(m.cover).slice(0, 500), title: text(m.title).slice(0, 200), artist: text(m.artist).slice(0, 200), replyTo: m.replyTo };
+    nexusOwners.set(msg.id, socket.id); if (nexusOwners.size > 300) nexusOwners.delete(nexusOwners.keys().next().value);
     history.push(msg); if (history.length > 50) history.shift();
     socket.to(NEXUS).emit('receive_global', msg); spy(NEXUS, msg, socket.id); msgCount++;
     if (nexusSize() <= 1) globalBot(socket, botReply(msg.text));
@@ -375,13 +425,15 @@ io.on('connection', socket => {
 
   socket.on('send_message', m => {
     const u = me(socket), r = u && rooms.get(u.room); if (!r || !m) return;
-    const t = text(m.text, u.god ? GOD_MAX : 5000);
+    if (isMuted(socket)) return socket.emit('announcement', { text: 'You are muted for a while after reports.' });
+    const t = clean(text(m.text, u.god ? GOD_MAX : 5000), u);
     if (!u.god && r.used + t.length > r.max) return;
     if (!u.god) r.used += t.length;
     const msg = { id: text(m.id).slice(0, 60), text: t, type: ['image', 'music'].includes(m.type) ? m.type : 'text', url: text(m.url).slice(0, 500),
       cover: text(m.cover).slice(0, 500), title: text(m.title).slice(0, 200), artist: text(m.artist).slice(0, 200),
       replyTo: m.replyTo };
     const p = peerOf(socket); if (p) io.to(p).emit('receive_message', msg);
+    (r.log = r.log || []).push({ uid: socket.id, t: msg.type, text: msg.text, url: msg.url }); if (r.log.length > 15) r.log.shift();
     if (msg.type !== 'text') socket.emit('receive_message', msg); // echo photos/music back so the sender sees them too
     spy(u.room, msg, socket.id); msgCount++;
     io.to(r.members).emit('sync_chars', { max: r.max, used: r.used });
