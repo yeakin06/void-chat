@@ -78,7 +78,7 @@ function botReply(t) {
   if (/\b(bye|goodbye|cya|gtg)\b/.test(x)) return 'See you later! Come back anytime 👋';
   if (/\b(name|who are you)\b/.test(x)) return "I'm Void Bot 🤖. I keep the Void company when it's quiet.";
   if (/music|song/.test(x)) return 'Music is great. Try the music button to share a song!';
-  if (/game|play/.test(x)) return 'Games are fun. Try the game button to start one!';
+  if (/game|play|rps|tic|connect/.test(x)) return 'I love games! Tap the 🎮 button and challenge me: Rock Paper Scissors, Tic Tac Toe or Connect 4. I accept every challenge.';
   if (x.includes('?')) return pick(['Good question. What do you think?', "Hmm, I'm only a simple bot. What's your take?", 'Tell me more, I like that question.']);
   return pick(['Interesting, tell me more.', 'Ha, I like that.', 'Go on, I am listening.', 'That makes sense. What else is on your mind?', 'Nice! What else?', "I'm only a bot, but I'm happy to chat."]);
 }
@@ -103,9 +103,153 @@ function scheduleBot(s) {
     rooms.set(roomId, { members: [s.id, BOT_ID], max: 1500, used: 0, isPrivate: false, bot: true });
     u2.room = roomId;
     s.emit('match_found', { roomId, karma: '5.0', flag: '🤖' });
-    botSay(s, "Hi! I'm Void Bot 🤖. Nobody else is online right now, so I'll keep you company. Click Next anytime to look for a real person.", 800);
+    botSay(s, "Hi! I'm Void Bot 🤖. Nobody else is online right now, so I'll keep you company. I can play games too, so tap the 🎮 button and challenge me! Click Next anytime to look for a real person.", 800);
   }, BOT_WAIT_MS);
 }
+// ---- Void Bot game AI (pure functions) ----
+const WINS3 = [[0,1,2],[3,4,5],[6,7,8],[0,3,6],[1,4,7],[2,5,8],[0,4,8],[2,4,6]];
+const t3win = b => { for (const [a, c, d] of WINS3) if (b[a] && b[a] === b[c] && b[a] === b[d]) return b[a]; return null; };
+function t3minimax(b, turn, depth) { // bot is 'O' (maximizes), human is 'X'
+  const w = t3win(b);
+  if (w) return { score: w === 'O' ? 10 - depth : depth - 10 };
+  const free = []; b.forEach((v, i) => { if (v === '') free.push(i); });
+  if (!free.length) return { score: 0 };
+  let bestScore = turn === 'O' ? -Infinity : Infinity, moves = [];
+  for (const i of free) {
+    b[i] = turn; const sc = t3minimax(b, turn === 'O' ? 'X' : 'O', depth + 1).score; b[i] = '';
+    if (turn === 'O' ? sc > bestScore : sc < bestScore) { bestScore = sc; moves = [i]; } else if (sc === bestScore) moves.push(i);
+  }
+  return { score: bestScore, move: pick(moves) };
+}
+function t3move(b) { // smart, but makes a random slip about 1 time in 5 so it can be beaten
+  const free = []; b.forEach((v, i) => { if (v === '') free.push(i); });
+  return crypto.randomInt(0, 100) < 20 ? pick(free) : t3minimax(b, 'O', 0).move;
+}
+
+const C4R = 6, C4C = 7;
+const c4new = () => Array.from({ length: C4R }, () => Array(C4C).fill(''));
+const c4row = (b, c) => { for (let r = C4R - 1; r >= 0; r--) if (b[r][c] === '') return r; return -1; };
+const c4full = b => b[0].every(x => x !== '');
+function c4win(b, r, c, p) {
+  for (const [dr, dc] of [[0, 1], [1, 0], [1, 1], [1, -1]]) {
+    let n = 1;
+    for (const sg of [1, -1]) for (let i = 1; i <= 3; i++) {
+      const nr = r + dr * i * sg, nc = c + dc * i * sg;
+      if (nr >= 0 && nr < C4R && nc >= 0 && nc < C4C && b[nr][nc] === p) n++; else break;
+    }
+    if (n >= 4) return true;
+  }
+  return false;
+}
+const C4WINDOWS = (() => {
+  const w = [];
+  for (let r = 0; r < C4R; r++) for (let c = 0; c < C4C; c++)
+    for (const [dr, dc] of [[0, 1], [1, 0], [1, 1], [1, -1]]) {
+      const cells = []; for (let i = 0; i < 4; i++) cells.push([r + dr * i, c + dc * i]);
+      if (cells.every(([y, x]) => y >= 0 && y < C4R && x >= 0 && x < C4C)) w.push(cells);
+    }
+  return w;
+})();
+function c4eval(b, p) {
+  const o = p === 'p1' ? 'p2' : 'p1'; let s = 0;
+  for (let r = 0; r < C4R; r++) if (b[r][3] === p) s += 3;
+  for (const cells of C4WINDOWS) {
+    let mine = 0, theirs = 0;
+    for (const [y, x] of cells) { if (b[y][x] === p) mine++; else if (b[y][x] === o) theirs++; }
+    if (mine && theirs) continue;
+    if (mine === 3) s += 5; else if (mine === 2) s += 2; else if (theirs === 3) s -= 4;
+  }
+  return s;
+}
+function c4search(b, p, depth, alpha, beta) {
+  const o = p === 'p1' ? 'p2' : 'p1';
+  const cols = [3, 2, 4, 1, 5, 0, 6].filter(c => b[0][c] === '');
+  if (!cols.length) return 0;
+  if (depth === 0) return c4eval(b, p);
+  let best = -Infinity;
+  for (const c of cols) {
+    const r = c4row(b, c); b[r][c] = p;
+    const sc = c4win(b, r, c, p) ? 1000 + depth : -c4search(b, o, depth - 1, -beta, -alpha);
+    b[r][c] = '';
+    if (sc > best) best = sc; if (best > alpha) alpha = best; if (alpha >= beta) break;
+  }
+  return best;
+}
+function c4move(b, p) { // looks 4 moves ahead, with a random slip about 1 time in 7
+  const o = p === 'p1' ? 'p2' : 'p1';
+  const cols = [0, 1, 2, 3, 4, 5, 6].filter(c => b[0][c] === '');
+  if (crypto.randomInt(0, 100) < 14) return pick(cols);
+  let best = -Infinity, bests = [];
+  for (const c of cols) {
+    const r = c4row(b, c); b[r][c] = p;
+    const sc = c4win(b, r, c, p) ? 100000 : -c4search(b, o, 3, -Infinity, Infinity);
+    b[r][c] = '';
+    if (sc > best) { best = sc; bests = [c]; } else if (sc === best) bests.push(c);
+  }
+  return pick(bests);
+}
+
+// ---- Void Bot plays the 1v1 games (same messages the page already uses) ----
+function botGame(s, r, d) {
+  if (!d || typeof d !== 'object') return;
+  const alive = () => { const u = users.get(s.id); return !!u && rooms.get(u.room) === r; };
+  const emitGA = (payload, delay) => setTimeout(() => { if (alive()) s.emit('game_action', payload); }, delay);
+
+  if (d.type === 'invite') {
+    const g = ['rps', 'ttt', 'c4'].includes(d.game) ? d.game : null; if (!g) return;
+    r.game = { type: g, board: g === 'ttt' ? Array(9).fill('') : g === 'c4' ? c4new() : null, turn: 'human', rpsDone: false };
+    emitGA({ type: 'accept', game: g }, 900);
+    botSay(s, pick(['Challenge accepted! 🎮 Good luck.', "You're on! Let's see what you've got 😎", "Game on! I won't go easy on you."]), 1000);
+    return;
+  }
+  const G = r.game; if (!G) return;
+  const end = (msg, delay) => { r.game = null; botSay(s, msg, delay); };
+
+  if (d.type === 'rps_move' && G.type === 'rps') {
+    const m = d.move; if (!['Rock', 'Paper', 'Scissors'].includes(m) || G.rpsDone) return;
+    G.rpsDone = true;
+    const bm = pick(['Rock', 'Paper', 'Scissors']);
+    const youWin = (m === 'Rock' && bm === 'Scissors') || (m === 'Paper' && bm === 'Rock') || (m === 'Scissors' && bm === 'Paper');
+    emitGA({ type: 'rps_move', move: bm }, 800);
+    setTimeout(() => end(m === bm ? `We both picked ${bm}! 🤝 Rematch?` : youWin ? `You got me! ${m} beats ${bm}. GG 👏` : `${bm} beats ${m}! 😎 Rematch?`, 100), 900);
+    return;
+  }
+
+  if (d.type === 'ttt_move' && G.type === 'ttt' && G.turn === 'human') {
+    const i = Number(d.index); if (!Number.isInteger(i) || i < 0 || i > 8 || G.board[i] !== '') return;
+    G.board[i] = 'X';
+    if (t3win(G.board)) return end('You win this one! GG 👏', 1200);
+    if (!G.board.includes('')) return end("It's a draw! Well played 🤝", 1200);
+    G.turn = 'bot';
+    const mv = t3move(G.board);
+    setTimeout(() => {
+      if (!alive() || r.game !== G) return;
+      G.board[mv] = 'O'; s.emit('game_action', { type: 'ttt_move', index: mv });
+      if (t3win(G.board)) end('I win this round! 😈 Rematch?', 900);
+      else if (!G.board.includes('')) end("It's a draw! Well played 🤝", 900);
+      else G.turn = 'human';
+    }, 800);
+    return;
+  }
+
+  if (d.type === 'c4_move' && G.type === 'c4' && G.turn === 'human') {
+    const c = Number(d.col); if (!Number.isInteger(c) || c < 0 || c > 6) return;
+    const row = c4row(G.board, c); if (row === -1) return;
+    G.board[row][c] = 'p1';
+    if (c4win(G.board, row, c, 'p1')) return end('Nice connect! You win 👏 GG', 1200);
+    if (c4full(G.board)) return end("The board is full. It's a draw! 🤝", 1200);
+    G.turn = 'bot';
+    const bc = c4move(G.board, 'p2');
+    setTimeout(() => {
+      if (!alive() || r.game !== G) return;
+      const br = c4row(G.board, bc); G.board[br][bc] = 'p2'; s.emit('game_action', { type: 'c4_move', col: bc });
+      if (c4win(G.board, br, bc, 'p2')) end('Four in a row! I win 😈 Rematch?', 900);
+      else if (c4full(G.board)) end("The board is full. It's a draw! 🤝", 900);
+      else G.turn = 'human';
+    }, 900);
+  }
+}
+
 const nexusSize = () => (io.sockets.adapter.rooms.get(NEXUS) || { size: 0 }).size;
 function globalBot(s, t) {
   setTimeout(() => {
@@ -214,7 +358,11 @@ io.on('connection', socket => {
   socket.on('typing', () => { const p = peerOf(socket); if (p) io.to(p).emit('typing'); });
   socket.on('react_message', d => { const p = peerOf(socket); if (p && d) io.to(p).emit('receive_reaction', { msgId: text(d.msgId), emoji: text(d.emoji).slice(0, 8) }); });
   socket.on('user_status', st => { const p = peerOf(socket); if (p) io.to(p).emit('stranger_status', st === 'offline' ? 'offline' : 'online'); });
-  socket.on('game_action', d => { const p = peerOf(socket); if (p) io.to(p).emit('game_action', d); });
+  socket.on('game_action', d => {
+    const u = me(socket), r = u && rooms.get(u.room);
+    if (r && r.bot) return botGame(socket, r, d);
+    const p = peerOf(socket); if (p) io.to(p).emit('game_action', d);
+  });
 
   socket.on('request_extend', () => { const p = peerOf(socket); if (p) io.to(p).emit('extend_requested'); });
   socket.on('accept_extend', () => {
