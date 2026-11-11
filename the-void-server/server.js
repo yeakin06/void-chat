@@ -78,7 +78,7 @@ function botReply(t) {
   if (/\b(bye|goodbye|cya|gtg)\b/.test(x)) return 'See you later! Come back anytime 👋';
   if (/\b(name|who are you)\b/.test(x)) return "I'm Void Bot 🤖. I keep the Void company when it's quiet.";
   if (/music|song/.test(x)) return 'Music is great. Try the music button to share a song!';
-  if (/game|play|rps|tic|connect/.test(x)) return 'I love games! Tap the 🎮 button and challenge me: Rock Paper Scissors, Tic Tac Toe or Connect 4. I accept every challenge.';
+  if (/game|play|rps|tic|connect/.test(x)) return 'I love games! Tap the 🎮 button and challenge me. I accept every challenge and play all eight games.';
   if (x.includes('?')) return pick(['Good question. What do you think?', "Hmm, I'm only a simple bot. What's your take?", 'Tell me more, I like that question.']);
   return pick(['Interesting, tell me more.', 'Ha, I like that.', 'Go on, I am listening.', 'That makes sense. What else is on your mind?', 'Nice! What else?', "I'm only a bot, but I'm happy to chat."]);
 }
@@ -103,7 +103,7 @@ function scheduleBot(s) {
     rooms.set(roomId, { members: [s.id, BOT_ID], max: 1500, used: 0, isPrivate: false, bot: true });
     u2.room = roomId;
     s.emit('match_found', { roomId, karma: '5.0', flag: '🤖' });
-    botSay(s, "Hi! I'm Void Bot 🤖. Nobody else is online right now, so I'll keep you company. I can play games too, so tap the 🎮 button and challenge me! Click Next anytime to look for a real person.", 800);
+    botSay(s, "Hi! I'm Void Bot 🤖. Nobody else is online right now, so I'll keep you company. I can play games too (Rock Paper Scissors, Tic Tac Toe, Connect 4, Quick Draw, Tap Race, Dice Duel, Math Sprint and Dots & Boxes), so tap the 🎮 button and challenge me! Click Next anytime to look for a real person.", 800);
   }, BOT_WAIT_MS);
 }
 // ---- Void Bot game AI (pure functions) ----
@@ -189,6 +189,20 @@ function c4move(b, p) { // looks 4 moves ahead, with a random slip about 1 time 
   return pick(bests);
 }
 
+// ---- Dots & Boxes bot brain (3x3 boxes, 24 lines: 0-11 horizontal, 12-23 vertical) ----
+const DB_BOXES = i => { const b = []; if (i < 12) { const r = Math.floor(i / 3), c = i % 3; if (r > 0) b.push((r - 1) * 3 + c); if (r < 3) b.push(r * 3 + c); } else { const j = i - 12, r = Math.floor(j / 4), c = j % 4; if (c > 0) b.push(r * 3 + c - 1); if (c < 3) b.push(r * 3 + c); } return b; };
+const DB_SIDES = k => { const r = Math.floor(k / 3), c = k % 3; return [r * 3 + c, (r + 1) * 3 + c, 12 + r * 4 + c, 12 + r * 4 + c + 1]; };
+const dbCount = (lines, k) => DB_SIDES(k).reduce((n, i) => n + (lines[i] ? 1 : 0), 0);
+function dbApply(G, i, who) { G.lines[i] = 1; let got = 0; for (const k of DB_BOXES(i)) if (G.own[k] === null && dbCount(G.lines, k) === 4) { G.own[k] = who; G.score[who]++; got++; } return got; }
+function dbPick(lines) { // take a box if possible, else a safe line, else give away as little as possible; slips 1 time in 8
+  const free = []; lines.forEach((v, i) => { if (!v) free.push(i); }); if (!free.length) return -1;
+  if (crypto.randomInt(0, 100) < 12) return pick(free);
+  const taking = free.filter(i => DB_BOXES(i).some(k => dbCount(lines, k) === 3)); if (taking.length) return pick(taking);
+  const cost = i => DB_BOXES(i).filter(k => dbCount(lines, k) === 2).length;
+  const safe = free.filter(i => cost(i) === 0); if (safe.length) return pick(safe);
+  const m = Math.min(...free.map(cost)); return pick(free.filter(i => cost(i) === m));
+}
+
 // ---- Void Bot plays the 1v1 games (same messages the page already uses) ----
 function botGame(s, r, d) {
   if (!d || typeof d !== 'object') return;
@@ -196,13 +210,39 @@ function botGame(s, r, d) {
   const emitGA = (payload, delay) => setTimeout(() => { if (alive()) s.emit('game_action', payload); }, delay);
 
   if (d.type === 'invite') {
-    const g = ['rps', 'ttt', 'c4'].includes(d.game) ? d.game : null; if (!g) return;
+    const g = ['rps', 'ttt', 'c4', 'draw', 'tap', 'dice', 'math', 'dots'].includes(d.game) ? d.game : null; if (!g) return;
     r.game = { type: g, board: g === 'ttt' ? Array(9).fill('') : g === 'c4' ? c4new() : null, turn: 'human', rpsDone: false };
+    if (g === 'dots') Object.assign(r.game, { lines: Array(24).fill(0), own: Array(9).fill(null), score: { h: 0, b: 0 }, over: false });
     emitGA({ type: 'accept', game: g }, 900);
     botSay(s, pick(['Challenge accepted! 🎮 Good luck.', "You're on! Let's see what you've got 😎", "Game on! I won't go easy on you."]), 1000);
     return;
   }
   const G = r.game; if (!G) return;
+  if (String(d.type).startsWith('x_')) { // Quick Draw, Tap Race, Dice Duel, Math Sprint
+    const rnd = (lo, hi) => lo + crypto.randomInt(0, hi - lo + 1);
+    if (d.type === 'x_draw_cfg' && G.type === 'draw') { const dl = Math.min(8000, Math.max(500, Number(d.d) || 2000)), ms = crypto.randomInt(0, 100) < 4 ? -1 : rnd(230, 420); emitGA({ type: 'x_draw_res', ms }, dl + Math.max(ms, 0) + 400); }
+    else if (d.type === 'x_tap_start' && G.type === 'tap') emitGA({ type: 'x_tap_res', n: rnd(24, 44) }, 8800);
+    else if (d.type === 'x_dice_res' && G.type === 'dice') emitGA({ type: 'x_dice_res', a: rnd(1, 6), b: rnd(1, 6) }, 1100);
+    else if (d.type === 'x_math_cfg' && G.type === 'math') { const ms = rnd(9000, 21000); emitGA({ type: 'x_math_res', ms }, ms); }
+    else if (d.type === 'x_dots_move' && G.type === 'dots' && G.turn === 'human' && !G.over) {
+      const i = Math.round(Number(d.l)); if (!(i >= 0 && i < 24) || G.lines[i]) return;
+      const finish = () => { G.over = true; botSay(s, G.score.b > G.score.h ? 'I win this one! 😈 Rematch?' : 'You win! GG 👏', 900); };
+      const got = dbApply(G, i, 'h');
+      if (G.lines.every(Boolean)) return finish();
+      if (got > 0) return; // you completed a box: you move again
+      G.turn = 'bot';
+      const play = () => {
+        if (!alive() || r.game !== G || G.over) return; const mv = dbPick(G.lines); if (mv < 0) return;
+        setTimeout(() => {
+          if (!alive() || r.game !== G || G.over) return;
+          const g2 = dbApply(G, mv, 'b'); s.emit('game_action', { type: 'x_dots_move', l: mv });
+          if (G.lines.every(Boolean)) finish(); else if (g2 > 0) play(); else G.turn = 'human';
+        }, 750);
+      };
+      play();
+    }
+    return;
+  }
   const end = (msg, delay) => { r.game = null; botSay(s, msg, delay); };
 
   if (d.type === 'rps_move' && G.type === 'rps') {
