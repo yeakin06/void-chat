@@ -19,6 +19,12 @@ if (ADMIN_PASSWORD.length < 10) {
 }
 if (!ORIGINS.length) console.warn('CORS_ORIGIN not set: browsers from other origins will be blocked.');
 
+// God mode: optional second password. Whoever unlocks it has no message-length limit and no cooldown.
+const GOD_PASSWORD = process.env.GOD_PASSWORD || '';
+const GOD_ON = GOD_PASSWORD.length >= 10 && GOD_PASSWORD !== ADMIN_PASSWORD;
+if (GOD_PASSWORD && !GOD_ON) console.warn('GOD_PASSWORD ignored: it must be 10+ characters and different from ADMIN_PASSWORD.');
+const GOD_MAX = 50000; // characters per message in God mode (server payload safety cap)
+
 const sha = s => crypto.createHash('sha256').update(String(s)).digest();
 const safeEq = (a, b) => crypto.timingSafeEqual(sha(a), sha(b));
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -50,7 +56,7 @@ app.post('/upload', (req, res) => {
 app.use('/uploads', express.static(UPLOAD_DIR, { setHeaders: r => r.setHeader('X-Content-Type-Options', 'nosniff') }));
 
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: ORIGINS.length ? ORIGINS : false }, maxHttpBufferSize: 1e5 });
+const io = new Server(server, { cors: { origin: ORIGINS.length ? ORIGINS : false }, maxHttpBufferSize: 4e5 });
 
 // ---- state ----
 const users = new Map();      // socketId -> { alias, admin, room, global, lastGlobal, fails:[] }
@@ -110,7 +116,7 @@ function globalBot(s, t) {
 
 const me = s => users.get(s.id);
 const peerOf = s => { const u = me(s); const r = u && rooms.get(u.room); return r ? r.members.find(i => i !== s.id) : null; };
-const text = v => (typeof v === 'string' ? v.slice(0, 5000) : '');
+const text = (v, n = 5000) => (typeof v === 'string' ? v.slice(0, n) : '');
 const spy = (roomId, m) => io.to('admins').emit('spy_feed', { roomId, text: esc(m.text || ''), type: m.type, url: m.type === 'image' || m.type === 'music' ? esc(m.url || '') : undefined, cover: esc(m.cover || ''), title: esc(m.title || ''), artist: esc(m.artist || '') });
 const failsByIp = new Map();
 const ipOf = s => String((s.handshake.headers['x-forwarded-for'] || s.handshake.address || '')).split(',')[0].trim();
@@ -139,7 +145,7 @@ function makeRoom(a, b, isPrivate) {
 }
 
 io.on('connection', socket => {
-  users.set(socket.id, { alias: null, admin: false, room: null, global: false, lastGlobal: 0 });
+  users.set(socket.id, { alias: null, admin: false, god: false, room: null, global: false, lastGlobal: 0 });
   socket.emit('stats_update', stats());
 
   socket.on('get_admin_data', pass => {
@@ -148,6 +154,13 @@ io.on('connection', socket => {
       u.admin = true; socket.join('admins');
       socket.emit('admin_dashboard', { totalUsers: io.engine.clientsCount, waitingUsers: waiting.length, activeRooms: rooms.size, totalVanished: vanished });
     } else socket.emit('admin_error');
+  });
+
+  socket.on('god_auth', pass => {
+    const u = me(socket); if (!GOD_ON) return socket.emit('god_error');
+    if (authFail(u, socket)) return socket.emit('god_error');
+    if (typeof pass === 'string' && safeEq(pass, GOD_PASSWORD)) { u.god = true; socket.emit('god_ok'); }
+    else socket.emit('god_error');
   });
 
   socket.on('find_match', () => {
@@ -173,10 +186,10 @@ io.on('connection', socket => {
   socket.on('send_global', m => {
     const u = me(socket); if (!u.global || !m) return;
     const now = Date.now();
-    if (now - u.lastGlobal < 10000) return;
+    if (!u.god && now - u.lastGlobal < 10000) return;
     u.lastGlobal = now;
     const msg = { id: text(m.id).slice(0, 60), sender: u.alias,
-      text: text(m.text), type: ['image', 'music'].includes(m.type) ? m.type : 'text', url: text(m.url).slice(0, 500),
+      text: text(m.text, u.god ? GOD_MAX : 5000), type: ['image', 'music'].includes(m.type) ? m.type : 'text', url: text(m.url).slice(0, 500),
       cover: text(m.cover).slice(0, 500), title: text(m.title).slice(0, 200), artist: text(m.artist).slice(0, 200), replyTo: m.replyTo };
     history.push(msg); if (history.length > 50) history.shift();
     socket.to(NEXUS).emit('receive_global', msg); spy(NEXUS, msg);
@@ -185,16 +198,16 @@ io.on('connection', socket => {
 
   socket.on('send_message', m => {
     const u = me(socket), r = u && rooms.get(u.room); if (!r || !m) return;
-    const t = text(m.text);
-    if (r.used + t.length > r.max) return;
-    r.used += t.length;
+    const t = text(m.text, u.god ? GOD_MAX : 5000);
+    if (!u.god && r.used + t.length > r.max) return;
+    if (!u.god) r.used += t.length;
     const msg = { id: text(m.id).slice(0, 60), text: t, type: ['image', 'music'].includes(m.type) ? m.type : 'text', url: text(m.url).slice(0, 500),
       cover: text(m.cover).slice(0, 500), title: text(m.title).slice(0, 200), artist: text(m.artist).slice(0, 200),
       replyTo: m.replyTo };
     const p = peerOf(socket); if (p) io.to(p).emit('receive_message', msg);
     spy(u.room, msg);
     io.to(r.members).emit('sync_chars', { max: r.max, used: r.used });
-    if (r.used >= r.max) io.to(r.members).emit('force_shatter');
+    if (!u.god && r.used >= r.max) io.to(r.members).emit('force_shatter');
     if (r.bot) botSay(socket, botReply(t));
   });
 
